@@ -1,137 +1,150 @@
 import socket
-import threading
+import ipaddress
+import psutil
+from scapy.all import ARP, Ether, srp
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-host = "127.0.0.1"
+def get_local_network():
 
-def portScan(host, port):
+    interfaces = psutil.net_if_addrs()
 
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client.settimeout(3)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     try:
-        client.connect((host, port))
-        banner = client.recv(1024).decode(errors="ignore").strip()
-
-        if banner.startswith("SSH"):
-            service = "SSH"
-
-        elif banner.startswith("HTTP"):
-            service = "HTTP"
-
-        elif banner.startswith("FTP"):
-            service = "FTP"
-
-        elif banner.startswith("SMTP"):
-            service = "SMTP"
-
-        elif port == 21:
-            service = "FTP"
-
-        elif port == 22:
-            service = "SSH"
-
-        elif port == 25:
-            service = "SMTP"
-
-        elif port == 53:
-            service = "DNS"
-
-        elif port == 80:
-            service = "HTTP"
-
-        elif port == 110:
-            service = "POP3"
-
-        elif port == 143:
-            service = "IMAP"
-
-        elif port == 443:
-            service = "HTTPS"
-
-        elif port == 3306:
-            service = "MySQL"
-
-        elif port == 5432:
-            service = "PostgreSQL"
-
-        elif port == 6379:
-            service = "Redis"
-
-        elif port == 8080:
-            service = "HTTP Proxy/Alternate HTTP"
-
-        elif port == 8443:
-            service = "HTTPS Alternate"
-
-        else:
-            service = "Unknown"
-
-        print() 
-        print(f"Port: {port}")
-        print(f"Status: OPEN")
-        print(f"Service: {service}")
-
-        if banner:
-            print(f"Banner: {banner}")
-        else:
-            print("Banner: no banner received")
-
-    except socket.timeout:
-
-        print(f"Port {port}: TIMEOUT")
-
-    except ConnectionRefusedError:
-
-        print(f"Port {port}: CLOSED")
-
-    except OSError as e:
-
-        print(f"Port {port}: Error: {e}")
-
+        sock.connect(("8.8.8.8", 80))
+        local_ip = sock.getsockname()[0]
     finally:
+        sock.close()
 
+    for interface, addresses in interfaces.items():
+
+        for address in addresses:
+
+            if address.family == socket.AF_INET:
+                
+                if address.address == local_ip:
+
+                    network = ipaddress.ip_network(
+                        f"{local_ip}/{address.netmask}",
+                        strict=False
+                    )
+
+                    return interface, local_ip, network
+
+    raise RuntimeError("Could not determine active network")
+
+
+interface, local_ip, network = get_local_network()
+
+print()
+print(f"Interface : {interface}")
+print(f"Local IP  : {local_ip}")
+print(f"Network   : {network}")
+
+print()
+print("===== ARP DEVICE DISCOVERY =====")
+
+
+arp_request = ARP(
+    pdst=str(network)
+)
+
+ethernet_frame = Ether(
+    dst="ff:ff:ff:ff:ff:ff"
+)
+
+packet = ethernet_frame / arp_request
+
+
+answered, unanswered = srp(
+    packet,
+    timeout=2,
+    verbose=0
+)
+
+
+print()
+print("IP Address       MAC Address           Hostname")
+print("-----------------------------------------------------")
+
+
+hosts = {
+    local_ip: socket.gethostname()
+}
+
+local_mac = "Unknown"
+
+for address in psutil.net_if_addrs()[interface]:
+
+    if address.family == psutil.AF_LINK:
+        local_mac = address.address
+        break
+
+
+# Print your own device
+print(
+    f"{local_ip:<16} "
+    f"{local_mac:<20} "
+    f"{socket.gethostname()}"
+)
+
+for sent, received in answered:
+
+    if received.psrc == local_ip:
+        continue
+
+    try:
+        hostname = socket.gethostbyaddr(
+            received.psrc
+        )[0]
+
+    except socket.herror:
+        hostname = "Unknown"
+
+    hosts[received.psrc] = hostname
+
+    print(
+        f"{received.psrc:<16} "
+        f"{received.hwsrc:<20} "
+        f"{hostname}"
+    )
+
+
+def portScan(host, port):
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.settimeout(1.5)
+    try:
+        result = client.connect_ex((host, port))
+        if result == 0:
+            tqdm.write(f"{host}:{port} OPEN")
+    finally:
         client.close()
 
 
 def main():
 
-    threads = []
+    for ip, hostname in hosts.items():
 
-    print("===== TCP PORT SCANNER =====")
-    port_range = input("Enter port range (example: 1-1024): ")
+        print()
+        print(f"Hostname: {hostname}")
+        print(f"IP      : {ip}")
 
-    try:
-        start, end = map(int, port_range.split("-"))
+        ports = range(1, 1001)
 
-    except ValueError:
-        print("Invalid port range.")
-        print("Use format: 1-1024")
-        return
+        with ThreadPoolExecutor(max_workers=40) as executor:
 
-    if start < 1 or end > 65535 or start > end:
-        print("Invalid port range.")
-        return
+            results = executor.map(
+                lambda port: portScan(ip, port),
+                ports
+            )
 
-    print()
-    print(f"Target: {host}")
-    print(f"Scanning ports: {start}-{end}")
-    print()
-
-    for port in range(start, end+1):
-
-        thread = threading.Thread(
-            target = portScan,
-            args = (host, port)
-        )
-
-        thread.start()
-        threads.append(thread)
-
-    for thread in threads:
-        thread.join()
-
-    print()
-    print("===== SCAN COMPLETE =====")
-
+            for _ in tqdm(
+                results,
+                total=1000,
+                desc=f"Scanning {ip}",
+                unit="port"
+            ):
+                pass
 
 main()
